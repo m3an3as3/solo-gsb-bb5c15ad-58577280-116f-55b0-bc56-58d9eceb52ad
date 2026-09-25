@@ -132,6 +132,36 @@ def _enumerate_hits(text: str, quote: str, cap: int) -> tuple[int, list[tuple[in
     return best, intervals
 
 
+def enumerate_qualified_hits(
+    text: str, quote: str, cap: int
+) -> tuple[int, list[tuple[int, int, int]]]:
+    """枚举编辑代价不超过 ``cap`` 的全部非空区间。
+
+    返回 ``(最小代价, [(start, end, cost), ...])``，区间按
+    ``(start, end)`` 升序；最小代价超过 ``cap`` 时返回 ``(best, [])``。
+
+    与 :func:`_enumerate_hits` 同理：合格区间长度必落在
+    ``len(quote) ± cap`` 之内（插入数、删除数之差不超过总代价），故逐窗口
+    以带状 :func:`_edit_cost` 复核即可；窗口真实代价不超过 ``cap`` 时带状
+    DP 给出精确值（最优路径上的累计插入/删除数不超过总代价，路径不出带）。
+    """
+    m, n = len(quote), len(text)
+    f = _forward_costs(text, quote)
+    best = min(f[m][j] for j in range(1, n + 1))
+    if best > cap:
+        return best, []
+
+    hits: list[tuple[int, int, int]] = []
+    for length in range(max(1, m - cap), min(n, m + cap) + 1):
+        for start in range(0, n - length + 1):
+            end = start + length
+            cost = _edit_cost(quote, text[start:end], cap)
+            if cost <= cap:
+                hits.append((start, end, cost))
+    hits.sort(key=lambda h: (h[0], h[1]))
+    return best, hits
+
+
 def locate_quote(segments: list[str], quote: str) -> dict:
     """在 2～5 段转写的拼接文本中定位引文。
 

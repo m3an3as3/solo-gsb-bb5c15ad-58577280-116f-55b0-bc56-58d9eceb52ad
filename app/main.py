@@ -16,6 +16,11 @@
   1～80 字引文 quote，在拼接文本中以编辑代价（相同字或任一侧 ``?`` 代价 0，
   替换/插入/删除代价 1）查找引文位置；唯一命中返回左闭右开区间、原文片段、
   代价与该区间逐字 sources，多区间并列返回 409，无合格区间返回 422。
+- ``POST /api/locate-quotes``：提交与 ``/api/assemble`` 相同的有序 segments 及
+  2～4 段按原文顺序排列的引文 quotes（各 1～80 字），逐段枚举编辑代价不超过
+  2 的全部非空区间候选，再选区间按序且互不重叠、总代价最低的完整定位链；唯一
+  最优链返回各引文区间、片段、代价与 sources，并列返回 409 及两条不同最优链，
+  无完整链返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -41,6 +46,17 @@ from .orderer import (
     MIN_SEGMENTS as ORDER_MIN_SEGMENTS,
 )
 from .orderer import NoCompleteOrderError, OrderTieError, determine_order
+from .quote_chain import (
+    MAX_QUOTES as LOCATE_MAX_QUOTES,
+)
+from .quote_chain import (
+    MIN_QUOTES as LOCATE_MIN_QUOTES,
+)
+from .quote_chain import (
+    QuoteChainNotFoundError,
+    QuoteChainTieError,
+    locate_quotes,
+)
 from .reviser import EditConflictError, EditLocationError, revise
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
@@ -352,6 +368,52 @@ class LocateQuoteResponse(QuoteHit):
     quote: str = Field(..., description="原样回显的引文")
 
 
+class LocateQuotesRequest(AssembleRequest):
+    """多段引文链式定位请求：与 /api/assemble 相同的有序 segments，外加引文列表。"""
+
+    quotes: list[str] = Field(
+        ...,
+        min_length=LOCATE_MIN_QUOTES,
+        max_length=LOCATE_MAX_QUOTES,
+        description="按原文顺序排列的 2～4 段引文（各 1～80 字），未辨认字以 ? 表示，"
+                    "可与拼接文本中的 ? 免代价配对",
+        examples=[["时习之", "不亦乐乎"]],
+    )
+
+    @model_validator(mode="after")
+    def _validate_quotes(self):
+        for idx, quote in enumerate(self.quotes):
+            if not 1 <= len(quote) <= LOCATE_MAX_QUOTE_LEN:
+                raise ValueError(
+                    f"第 {idx + 1} 段引文长度需为 1～{LOCATE_MAX_QUOTE_LEN} 字"
+                )
+        return self
+
+
+class QuoteChainHit(QuoteHit):
+    """完整定位链中一段引文的命中区间。"""
+
+    quote: str = Field(..., description="该引文原文（原样回显）")
+
+
+class QuoteChain(BaseModel):
+    """一条完整定位链：覆盖全部引文，区间按序且互不重叠。"""
+
+    cost: int = Field(..., description="链上各引文与区间代价之和（总代价）")
+    hits: list[QuoteChainHit] = Field(
+        ...,
+        description="按引文顺序给出的各段命中区间，"
+                    "满足前一区间终点不超过后一区间起点（可首尾相接）",
+    )
+
+
+class LocateQuotesResponse(QuoteChain):
+    """多段引文唯一最优链时的定位结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    quotes: list[str] = Field(..., description="原样回显的引文列表")
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -362,6 +424,7 @@ def index():
         "order": "POST /api/order",
         "revise": "POST /api/revise",
         "locate_quote": "POST /api/locate-quote",
+        "locate_quotes": "POST /api/locate-quotes",
         "docs": "/docs",
         "health": "/health",
     }
@@ -678,5 +741,126 @@ def api_locate_quote(req: LocateQuoteRequest):
                 "message": str(exc),
                 "cost": exc.cost,
                 "ties": exc.hits,
+            },
+        ) from exc
+
+
+@app.post(
+    "/api/locate-quotes",
+    response_model=LocateQuotesResponse,
+    status_code=200,
+    summary="在拼接文本中为 2～4 段按序引文定位互不重叠的完整链",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "另附按原文顺序排列的 2～4 段引文 `quotes`（各 1～80 字，未辨认字以 `?` "
+        "表示）。接口先复用 `/api/assemble` 得到拼接文本与逐字来源，再对**每段"
+        "引文独立**枚举与拼接文本任意非空连续区间编辑代价不超过 **2** 的全部候选"
+        "（相同字或任一侧为 `?` 代价 0；替换、插入、删除各代价 1；即便某段单独"
+        "最低代价的区间无法接入完整链，也会保留该段其余合格候选）。随后从候选中"
+        "选出各引文区间**按原文顺序、互不重叠**（前一区间终点不超过后一区间起点，"
+        "可首尾相接）且**总代价（各段代价之和）最低**的完整定位链。唯一最优链时"
+        "返回总代价 `cost` 及按引文顺序排列的各区间 `hits`（各带原文 `quote`、"
+        "左闭右开区间、片段 `fragment`、本段代价与逐字 `sources`），并回显完整"
+        "拼接文本 `text` 与 `quotes`；总代价最低的链由多个**不同区间序列**并列时"
+        "返回 **409**，`detail.ties` 给出按区间序列字典序排列的**两条**不同最优链；"
+        "任一段引文无合格区间、或不存在覆盖全部引文的完整链时返回 **422**。"
+        "接口只做定位，不改写拼接文本。"
+    ),
+    responses={
+        409: {
+            "description": "总代价最低的完整定位链由多个不同区间序列并列取得",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "总代价 0 的完整定位链有多个并列，无法唯一定位",
+                            "cost": 0,
+                            "ties": [
+                                {
+                                    "cost": 0,
+                                    "hits": [
+                                        {
+                                            "quote": "甲",
+                                            "start": 0,
+                                            "end": 1,
+                                            "fragment": "甲",
+                                            "cost": 0,
+                                            "sources": [[{"segment": 0, "pos": 0}]],
+                                        },
+                                        {
+                                            "quote": "丙",
+                                            "start": 2,
+                                            "end": 3,
+                                            "fragment": "丙",
+                                            "cost": 0,
+                                            "sources": [[{"segment": 0, "pos": 2}]],
+                                        },
+                                    ],
+                                },
+                                {
+                                    "cost": 0,
+                                    "hits": [
+                                        {
+                                            "quote": "甲",
+                                            "start": 4,
+                                            "end": 5,
+                                            "fragment": "甲",
+                                            "cost": 0,
+                                            "sources": [[{"segment": 1, "pos": 1}]],
+                                        },
+                                        {
+                                            "quote": "丙",
+                                            "start": 5,
+                                            "end": 6,
+                                            "fragment": "丙",
+                                            "cost": 0,
+                                            "sources": [[{"segment": 1, "pos": 2}]],
+                                        },
+                                    ],
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "续接失败、参数不合法，或不存在覆盖全部引文的完整定位链",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "第 2 段引文的全部合格区间都无法与前文引文的合格区间按序且互不重叠地衔接，不存在覆盖全部引文的完整定位链"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_locate_quotes(req: LocateQuotesRequest):
+    try:
+        return locate_quotes(req.segments, req.quotes)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except QuoteChainNotFoundError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+    except QuoteChainTieError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "cost": exc.cost,
+                "ties": exc.ties,
             },
         ) from exc

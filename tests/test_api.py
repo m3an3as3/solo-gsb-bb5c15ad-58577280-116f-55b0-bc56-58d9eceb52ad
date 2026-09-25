@@ -541,3 +541,170 @@ def test_locate_quote_quote_length_validated():
     # 恰好 80 字可通过参数校验（是否命中不影响 422 校验语义）
     resp = client.post("/api/locate-quote", json={**base, "quote": "字" * 80})
     assert resp.status_code in (200, 409, 422)
+
+
+def test_locate_quotes_endpoint_unique_chain():
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "quotes": ["时习之", "不亦乐乎"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert data["quotes"] == ["时习之", "不亦乐乎"]
+    assert data["cost"] == 0
+    assert [(h["start"], h["end"], h["fragment"], h["cost"]) for h in data["hits"]] == [
+        (2, 5, "时习之", 0),
+        (5, 9, "不亦乐乎", 0),
+    ]
+    # 区间逐字 sources 与 /api/assemble 对应区间一致
+    assembled = client.post(
+        "/api/assemble",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"]},
+    ).json()
+    assert data["hits"][0]["sources"] == assembled["sources"][2:5]
+    assert data["hits"][1]["sources"] == assembled["sources"][5:9]
+
+
+def test_locate_quotes_uses_non_minimal_candidate_when_needed():
+    # "甲" 的单独最优区间 [4,5) 后接不上 "丙"，需改用 [0,1)
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["甲X丙丁甲乙", "甲X丙丁甲乙"],
+            "quotes": ["甲", "丙"],
+        },
+    )
+    assert resp.status_code == 200
+    hits = resp.json()["hits"]
+    assert [(h["start"], h["end"], h["fragment"]) for h in hits] == [
+        (0, 1, "甲"),
+        (2, 3, "丙"),
+    ]
+
+
+def test_locate_quotes_tie_returns_409_with_two_chains():
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["丁甲戊甲丙", "甲丙庚"],
+            "quotes": ["甲", "丙"],
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["cost"] == 0
+    assert len(detail["ties"]) == 2
+    chains = [
+        [(h["start"], h["end"]) for h in t["hits"]] for t in detail["ties"]
+    ]
+    assert chains == [[(1, 2), (4, 5)], [(3, 4), (4, 5)]]
+    for tie in detail["ties"]:
+        assert tie["cost"] == 0
+        assert [h["quote"] for h in tie["hits"]] == ["甲", "丙"]
+        assert all(len(h["sources"]) == len(h["fragment"]) for h in tie["hits"])
+
+
+def test_locate_quotes_more_than_two_ties_lists_two():
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["丁甲丙戊甲丙", "甲丙庚"],
+            "quotes": ["甲", "丙"],
+        },
+    )
+    assert resp.status_code == 409
+    chains = [
+        [(h["start"], h["end"]) for h in t["hits"]]
+        for t in resp.json()["detail"]["ties"]
+    ]
+    assert chains == [[(1, 2), (2, 3)], [(1, 2), (5, 6)]]
+
+
+def test_locate_quotes_no_complete_chain_returns_422():
+    # 两段引文都有代价 0 区间，但无法按序衔接
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["戊己庚丁甲乙丙", "戊己庚丁甲乙丙"],
+            "quotes": ["甲乙丙", "戊己庚"],
+        },
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+    # 某段引文自身无合格区间
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "quotes": ["时习之", "朋朋朋"],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_locate_quotes_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/locate-quotes",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "quotes": ["孔子", "未知"],
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_locate_quotes_reuses_assemble_segment_limits():
+    body = {"quotes": ["a", "b"]}
+    # 段数不足 / 超上限
+    assert client.post(
+        "/api/locate-quotes", json={**body, "segments": ["abc"]}
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quotes",
+        json={**body, "segments": ["aa", "bb", "cc", "dd", "ee", "ff"]},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/locate-quotes",
+        json={**body, "segments": ["a" * 500, "b" * 501]},
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quotes",
+        json={**body, "segments": ["字" * 400, "字" * 401]},
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quotes",
+        json={**body, "segments": ["abc", ""]},
+    ).status_code == 422
+
+
+def test_locate_quotes_quote_list_validated():
+    base = {"segments": ["学而?习之", "时习之不"]}
+    # 缺 quotes 字段 / 仅 1 段 / 5 段
+    assert client.post("/api/locate-quotes", json=base).status_code == 422
+    assert client.post(
+        "/api/locate-quotes", json={**base, "quotes": ["学"]}
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quotes",
+        json={**base, "quotes": ["学", "时", "习", "亦", "乐"]},
+    ).status_code == 422
+    # 空引文 / 81 字引文
+    assert client.post(
+        "/api/locate-quotes", json={**base, "quotes": ["", "学"]}
+    ).status_code == 422
+    assert client.post(
+        "/api/locate-quotes", json={**base, "quotes": ["学", "字" * 81]}
+    ).status_code == 422
+    # 恰好 80 字、恰好 4 段引文可通过参数校验
+    resp = client.post(
+        "/api/locate-quotes",
+        json={**base, "quotes": ["学", "时", "习", "?" * 80]},
+    )
+    assert resp.status_code in (200, 409, 422)
