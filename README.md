@@ -19,6 +19,11 @@
 在拼接文本中以逐字编辑代价（相同字或任一侧 `?` 代价 **0**，替换/插入/删除各代价 **1**）查找引文位置；
 最小代价不超过 **2** 且区间唯一时返回**左闭右开区间**、原文片段、代价与该区间逐字 `sources`，
 多个不同区间并列返回 **409**（列出全部并列区间），无合格区间返回 **422**；只定位、不改写拼接文本。
+- **`POST /api/locate-quotes`**：提交与 `/api/assemble` 相同的有序 `segments` 及 **2～4 段按原文顺序
+排列**的引文 `quotes`（各 1～80 字），为每段引文枚举编辑代价不超过 **2** 的全部非空区间，再选出区间
+按序且**互不重叠**、总代价最低的**完整定位链**（即使某段单独最低代价的候选无法接入完整链，也会考虑
+该段其余合格候选）；唯一最优链返回各引文区间、片段、代价与 `sources`，多个不同最优链并列返回 **409**
+（给出两条不同最优链），无完整链返回 **422**。
 
 ## 快速开始
 
@@ -618,6 +623,171 @@ curl -X POST http://localhost:8000/api/locate-quote \
 `quote` 为空、超过 80 字、缺字段，或 segments 不满足 `/api/assemble` 的段数/长度限制、续接失败，
 同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
 
+### `POST /api/locate-quotes`
+
+在拼接文本中**按原文顺序同时定位 2～4 段引文**。请求的 `segments` 与 `/api/assemble` 完全相同
+（沿用 2～5 段、单段最长 500 字、总长最长 800 字的限制与续接门槛，续接失败同样返回 **422** 并给出
+`failed_segment`），另附 **2～4 段按原文顺序排列**的引文 `quotes`（每段 **1～80** 字，未辨认字也以
+`?` 表示）。接口先复用 `/api/assemble` 得到拼接文本与逐字来源，然后：
+
+- **枚举候选**：对每段引文枚举与拼接文本的任意非空连续区间、逐字编辑代价不超过 **2** 的**全部**区间
+  （代价规则同 `/api/locate-quote`：相同字或任一侧 `?` 代价 **0**，替换/插入/删除各代价 **1**，
+  区间两端自由、引文完全消耗）；
+- **选完整定位链**：从各段候选中选出区间按引文顺序排列、**两两不重叠**（前段 `end` ≤ 后段 `start`，
+  相邻可贴合，不共享字即不算重叠）且**各段代价之和最低**的完整链；
+- **不放弃次优候选**：即使某段引文单独最低代价的候选无法接入完整链（例如与前一段区间重叠），也会
+  继续考虑该段其余代价不超过 2 的合格候选；
+- **唯一最优链**时返回 `total_cost` 与 `hits`（与 `quotes` 等长、等序，每项含该段引文的区间、
+  原文片段 `fragment`、本段代价 `cost` 与该区间逐字 `sources`）；
+- **多个不同最优链并列**时返回 **409**，`detail.ties` 给出**两条不同的最优链**（按区间坐标字典序
+  取最小的两条；同一组区间即使存在多种内部对齐方式也只算一条链）；
+- **无完整链**（某段引文没有代价 ≤ 2 的区间，或所有合格区间都无法按序组成互不重叠的链）时返回
+  **422**。接口**只做定位，不改写拼接文本**。
+
+请求体：
+
+```json
+{
+  "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+  "quotes": ["学而", "时习之", "不亦乐乎"]
+}
+```
+
+- `segments`：必填，2～5 个非空字符串；单段最长 500 字，各段总长最长 800 字（同 `/api/assemble`）。
+- `quotes`：必填，**2～4** 个非空字符串；每段 **1～80** 字，按引文在原文中的先后顺序排列。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/locate-quotes \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["学而?习之", "时习之不", "之不亦乐乎"], "quotes": ["学而", "时习之", "不亦乐乎"]}'
+```
+
+响应示例（三段引文在拼接文本 `学而时习之不亦乐乎` 中代价均为 0，区间 `[0,2)`、`[2,5)`、`[5,9)`
+按序贴合，总代价 0）：
+
+```json
+{
+  "text": "学而时习之不亦乐乎",
+  "quotes": ["学而", "时习之", "不亦乐乎"],
+  "total_cost": 0,
+  "hits": [
+    {
+      "start": 0,
+      "end": 2,
+      "fragment": "学而",
+      "cost": 0,
+      "sources": [
+        [{ "segment": 0, "pos": 0 }],
+        [{ "segment": 0, "pos": 1 }]
+      ]
+    },
+    {
+      "start": 2,
+      "end": 5,
+      "fragment": "时习之",
+      "cost": 0,
+      "sources": [
+        [{ "segment": 0, "pos": 2 }, { "segment": 1, "pos": 0 }],
+        [{ "segment": 0, "pos": 3 }, { "segment": 1, "pos": 1 }],
+        [{ "segment": 0, "pos": 4 }, { "segment": 1, "pos": 2 }, { "segment": 2, "pos": 0 }]
+      ]
+    },
+    {
+      "start": 5,
+      "end": 9,
+      "fragment": "不亦乐乎",
+      "cost": 0,
+      "sources": [
+        [{ "segment": 1, "pos": 3 }, { "segment": 2, "pos": 1 }],
+        [{ "segment": 2, "pos": 2 }],
+        [{ "segment": 2, "pos": 3 }],
+        [{ "segment": 2, "pos": 4 }]
+      ]
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` | 拼接文本（与 `/api/assemble` 一致，不被改写） |
+| `quotes` | 原样回显的引文列表（2～4 段，按原文顺序排列） |
+| `total_cost` | 完整定位链上各段引文代价之和 |
+| `hits[]` | 各引文的定位结果，与 `quotes` 等长、等序；字段同 `/api/locate-quote`（`start`/`end`/`fragment`/`cost`/`sources`），相邻区间满足前段 `end` ≤ 后段 `start` |
+
+**次优候选成链**示例——两段引文都是单字 `甲` 时，第二段单独的代价 0 区间 `[0,1)` 与第一段重叠、
+无法接入完整链；接口改取该段代价 1 的区间 `[1,2)`（片段 `乙`，替换 1 次），总代价 1：
+
+```bash
+curl -X POST http://localhost:8000/api/locate-quotes \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙", "甲乙"], "quotes": ["甲", "甲"]}'
+```
+
+```json
+{
+  "text": "甲乙",
+  "quotes": ["甲", "甲"],
+  "total_cost": 1,
+  "hits": [
+    { "start": 0, "end": 1, "fragment": "甲", "cost": 0, "sources": [[{ "segment": 0, "pos": 0 }]] },
+    { "start": 1, "end": 2, "fragment": "乙", "cost": 1, "sources": [[{ "segment": 0, "pos": 1 }, { "segment": 1, "pos": 1 }]] }
+  ]
+}
+```
+
+**多个最优链并列（409）**示例——拼接文本 `甲丙甲丙` 中，引文 `甲`、`丙` 各有两个代价 0 位置，
+`甲[0,1) → 丙[1,2)` 与 `甲[0,1) → 丙[3,4)` 总代价同为 0，接口不擅自选择，返回两条不同最优链：
+
+```bash
+curl -X POST http://localhost:8000/api/locate-quotes \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲丙甲丙", "甲丙甲丙"], "quotes": ["甲", "丙"]}'
+```
+
+```json
+{
+  "detail": {
+    "message": "2 段引文在拼接文本中有多个不同定位链以最低总代价 0 并列，无法唯一确定",
+    "cost": 0,
+    "ties": [
+      [
+        { "start": 0, "end": 1, "fragment": "甲", "cost": 0, "sources": [[{ "segment": 0, "pos": 0 }]] },
+        { "start": 1, "end": 2, "fragment": "丙", "cost": 0, "sources": [[{ "segment": 0, "pos": 1 }]] }
+      ],
+      [
+        { "start": 0, "end": 1, "fragment": "甲", "cost": 0, "sources": [[{ "segment": 0, "pos": 0 }]] },
+        { "start": 3, "end": 4, "fragment": "丙", "cost": 0, "sources": [[{ "segment": 0, "pos": 3 }]] }
+      ]
+    ]
+  }
+}
+```
+
+**无完整链（422）**示例——两段引文各自都有代价不超过 2 的区间，但可行区间的先后顺序与引文顺序
+相反，无法选出互不重叠的完整链（某段引文本身无合格区间时同样返回 422，并指出是第几段引文）：
+
+```bash
+curl -X POST http://localhost:8000/api/locate-quotes \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲甲乙乙", "甲甲乙乙"], "quotes": ["乙乙XX", "甲甲XX"]}'
+```
+
+```json
+{
+  "detail": {
+    "message": "各段引文虽有代价不超过 2 的区间，但无法按原文顺序选出互不重叠的完整定位链"
+  }
+}
+```
+
+`quotes` 段数不在 2～4、某段为空或超过 80 字、缺字段，或 segments 不满足 `/api/assemble` 的
+段数/长度限制、续接失败，同样返回 **422**（续接失败时给出 `failed_segment`，从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -645,6 +815,10 @@ curl -X POST http://localhost:8000/api/locate-quote \
   代价 1，区间两端自由、引文完全消耗；最小代价不超过 2 且区间唯一时返回左闭右开区间、原文片段、
   代价与该区间逐字 sources，多个不同区间并列返回 **409**，无合格区间返回 **422**；只定位、不改写
   拼接文本。
+- `/api/locate-quotes` 对 2～4 段按原文顺序排列的引文（各 1～80 字），枚举每段代价不超过 2 的全部
+  非空区间（代价规则同上），再选区间按序、两两不重叠（前段 `end` ≤ 后段 `start`）且总代价最低的
+  完整定位链；某段单独最优候选无法成链时仍考虑该段其余候选。唯一最优链返回各引文区间、片段、代价与
+  sources，多个不同最优链并列返回 **409**（两条不同最优链），无完整链返回 **422**。
 
 ## 本地开发（不使用 Docker）
 
@@ -669,8 +843,8 @@ app/
   collator.py   # 异文校勘：复用拼接文本与逐字来源，段级投票回查原字
   orderer.py    # 未排序转写：穷举排列 + 累计对齐得分选序 + 并列/无完整顺序判定
   reviser.py    # 人工校订：沿逐字来源定位校订并落实改字 + 合并/冲突/定位判定
-  locator.py    # 引文定位：半全局编辑代价 DP 查拼接文本区间 + 并列/无合格区间判定
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote）
+  locator.py    # 引文定位：半全局编辑代价 DP 查拼接文本区间；多引文按序不重叠最优链 + 并列/无完整链判定
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml
